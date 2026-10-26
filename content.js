@@ -167,7 +167,7 @@
            document.querySelector("video");
   }
 
-  async function waitForVideo(timeoutMs = 25000) {
+  async function waitForVideo(timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const v = findVideo();
@@ -213,7 +213,10 @@
 
     try {
       await new Promise((resolve, reject) => {
-        const timeoutMs = Math.max((duration / TARGET_RATE) * 1000 + 15000, 30000);
+        const timeoutMs = Math.min(
+          15 * 60 * 1000,
+          Math.max(duration * 1000 + 60000, 120000)
+        );
         const timeout = setTimeout(() => finish(new Error("Video playback timed out")), timeoutMs);
         let resumeTimer = null;
         let settled = false;
@@ -243,7 +246,10 @@
 
         video.addEventListener("ended", onEnded);
         video.addEventListener("pause", onPause);
-        if (video.ended) finish();
+        if (video.ended) {
+          finish();
+          return;
+        }
 
         startPlayback(video).catch((error) => finish(error));
       });
@@ -255,16 +261,25 @@
   }
 
   // ── Job tab auto-play ─────────────────────────────────────────────
+  async function waitForJobTab(timeoutMs = 30000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const resp = await chrome.runtime.sendMessage({ type: "AM_I_JOB_TAB" });
+        if (resp?.isJobTab) return true;
+      } catch {
+        return false;
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
   async function checkIfJobTab() {
     const videoSlug = extractVideoSlug();
     if (!videoSlug) return;
 
-    try {
-      const resp = await chrome.runtime.sendMessage({ type: "AM_I_JOB_TAB" });
-      if (!resp?.isJobTab) return;
-    } catch {
-      return;
-    }
+    if (!await waitForJobTab()) return;
 
     console.log("[LinkedLearn] This is a job tab — auto-playing...");
 

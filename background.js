@@ -118,7 +118,7 @@ function launchNextBatch() {
           }
         }, Math.min(
           MAX_TAB_RUNTIME_MS,
-          Math.max(120000, (video.durationInSeconds || 600) * 1000 / TARGET_RATE + 60000)
+          Math.max(120000, (video.durationInSeconds || 600) * 1000 + 60000)
         ));
         console.log(`[LinkedLearn BG] Window ${win.id} → "${video.title}"`);
         broadcastProgress();
