@@ -1,4 +1,6 @@
 const CONCURRENCY = 4;
+const TARGET_RATE = 10;
+const MAX_TAB_RUNTIME_MS = 15 * 60 * 1000;
 
 let job = null;
 let nextJobId = 1;
@@ -55,6 +57,7 @@ function startJob(videos) {
     total: queue.length,
     activeTabs: new Set(),
     tabToWindow: {},
+    tabTimeouts: {},
     launching: 0,
   };
 
@@ -79,11 +82,16 @@ function launchNextBatch() {
     const video = currentJob.queue.shift();
     currentJob.launching++;
 
-    const url = `https://www.linkedin.com/learning/${video.courseSlug}/${video.slug}?autoSkip=true&resume=false&u=${video.uParam || ""}`;
+    const url = new URL(
+      `https://www.linkedin.com/learning/${encodeURIComponent(video.courseSlug)}/${encodeURIComponent(video.slug)}`
+    );
+    url.searchParams.set("autoSkip", "true");
+    url.searchParams.set("resume", "false");
+    if (video.uParam) url.searchParams.set("u", video.uParam);
 
     try {
       chrome.windows.create({
-        url,
+        url: url.toString(),
         type: "normal",
         width: 800,
         height: 600,
@@ -104,6 +112,14 @@ function launchNextBatch() {
         const tabId = win.tabs[0].id;
         currentJob.activeTabs.add(tabId);
         currentJob.tabToWindow[tabId] = win.id;
+        currentJob.tabTimeouts[tabId] = setTimeout(() => {
+          if (job === currentJob && currentJob.activeTabs.has(tabId)) {
+            handleVideoDone(tabId, video.title, "Video tab exceeded the maximum runtime");
+          }
+        }, Math.min(
+          MAX_TAB_RUNTIME_MS,
+          Math.max(120000, (video.durationInSeconds || 600) * 1000 / TARGET_RATE + 60000)
+        ));
         console.log(`[LinkedLearn BG] Window ${win.id} → "${video.title}"`);
         broadcastProgress();
       });
@@ -121,6 +137,10 @@ function handleVideoDone(tabId, title, error) {
   if (!job || !tabId || !job.activeTabs.has(tabId)) return;
 
   job.activeTabs.delete(tabId);
+  if (job.tabTimeouts[tabId]) {
+    clearTimeout(job.tabTimeouts[tabId]);
+    delete job.tabTimeouts[tabId];
+  }
 
   if (error) {
     job.failed++;
@@ -150,6 +170,7 @@ function cancelJob() {
   for (const winId of Object.values(currentJob.tabToWindow)) {
     chrome.windows.remove(Number(winId)).catch(() => {});
   }
+  Object.values(currentJob.tabTimeouts).forEach(clearTimeout);
   console.log("[LinkedLearn BG] Cancelled");
 }
 

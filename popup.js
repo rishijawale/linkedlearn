@@ -2,6 +2,7 @@
   "use strict";
 
   let courseVideos = [];
+  let startingJob = false;
   const $ = (sel) => document.querySelector(sel);
 
   function showView(id) {
@@ -77,6 +78,10 @@
   });
 
   async function startJob(type) {
+    if (startingJob) return;
+    startingJob = true;
+    $("#btn-complete-remaining").disabled = true;
+    $("#btn-complete-all").disabled = true;
     startProgress();
     try {
       const response = await sendToContent({ type, videos: courseVideos });
@@ -86,6 +91,10 @@
     } catch (err) {
       $("#error-msg").textContent = `Could not start job: ${err.message}`;
       showView("view-error");
+      $("#btn-complete-remaining").disabled = false;
+      $("#btn-complete-all").disabled = false;
+    } finally {
+      startingJob = false;
     }
   }
 

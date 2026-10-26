@@ -106,9 +106,9 @@
     const data = await apiFetch(
       `https://www.linkedin.com/learning-api/detailedCourses?addParagraphsToTranscript=false&courseSlug=${encodeURIComponent(courseSlug)}&q=slugs&trimCourseVideos=false`
     );
-    const included = data.included || [];
+    const included = Array.isArray(data.included) ? data.included : [];
     const course = included.find((i) => i.$type === "com.linkedin.learning.api.DetailedCourse");
-    if (!course?.chapters) throw new Error("No chapters found");
+    if (!Array.isArray(course?.chapters)) throw new Error("No chapters found");
 
     // Build status lookup — try both cachingKey and by matching video URN
     const statusByCachingKey = {};
@@ -125,8 +125,9 @@
     const uParam = getUParam();
     const videos = [];
     for (const ch of course.chapters) {
-      if (!ch.videos) continue;
+      if (!Array.isArray(ch.videos)) continue;
       for (const v of ch.videos) {
+        if (!v?.slug || !v?.title) continue;
         let state = "NOT_STARTED";
 
         // Try multiple ways to find the viewing status
@@ -180,6 +181,20 @@
     window.dispatchEvent(new CustomEvent("linkedlearn-set-speed", { detail: { rate } }));
   }
 
+  async function startPlayback(video, attempts = 3) {
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        await video.play();
+        return;
+      } catch (error) {
+        lastError = error;
+        await sleep(1000);
+      }
+    }
+    throw new Error(`Could not start video playback: ${lastError?.message || "unknown error"}`);
+  }
+
   async function playVideoToCompletion() {
     const video = await waitForVideo();
     const duration = video.duration;
@@ -200,10 +215,16 @@
       await new Promise((resolve, reject) => {
         const timeoutMs = Math.max((duration / TARGET_RATE) * 1000 + 15000, 30000);
         const timeout = setTimeout(() => finish(new Error("Video playback timed out")), timeoutMs);
+        let resumeTimer = null;
+        let settled = false;
 
         function finish(error) {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeout);
+          if (resumeTimer) clearTimeout(resumeTimer);
           video.removeEventListener("ended", onEnded);
+          video.removeEventListener("pause", onPause);
           if (error) reject(error);
           else resolve();
         }
@@ -212,12 +233,19 @@
           finish();
         }
 
+        function onPause() {
+          if (video.ended || settled) return;
+          if (resumeTimer) clearTimeout(resumeTimer);
+          resumeTimer = setTimeout(() => {
+            startPlayback(video).catch((error) => finish(error));
+          }, 500);
+        }
+
         video.addEventListener("ended", onEnded);
+        video.addEventListener("pause", onPause);
         if (video.ended) finish();
 
-        video.play().catch(() => {
-          finish(new Error("Could not start video playback"));
-        });
+        startPlayback(video).catch((error) => finish(error));
       });
 
       console.log("[LinkedLearn] Video ended");
