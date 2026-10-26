@@ -1,6 +1,12 @@
 const CONCURRENCY = 4;
 
 let job = null;
+let nextJobId = 1;
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (!job || !job.activeTabs.has(tabId)) return;
+  handleVideoDone(tabId, "Closed video tab", "Video tab was closed before completion");
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "START_JOB") {
@@ -40,17 +46,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 function startJob(videos) {
   if (job) cancelJob();
 
+  const queue = Array.isArray(videos) ? videos.filter(isValidVideo) : [];
   job = {
-    queue: [...videos],
+    id: nextJobId++,
+    queue,
     done: 0,
     failed: 0,
-    total: videos.length,
+    total: queue.length,
     activeTabs: new Set(),
     tabToWindow: {},
     launching: 0,
   };
 
-  console.log(`[LinkedLearn BG] Job: ${videos.length} videos, ${CONCURRENCY} windows`);
+  console.log(`[LinkedLearn BG] Job: ${queue.length} videos, ${CONCURRENCY} windows`);
+  if (queue.length === 0) {
+    broadcastDone();
+    job = null;
+    return;
+  }
   broadcastProgress();
   launchNextBatch();
 }
@@ -58,38 +71,50 @@ function startJob(videos) {
 function launchNextBatch() {
   if (!job) return;
 
-  const slotsAvailable = CONCURRENCY - job.activeTabs.size - job.launching;
-  const toLaunch = Math.min(slotsAvailable, job.queue.length);
+  const currentJob = job;
+  const slotsAvailable = CONCURRENCY - currentJob.activeTabs.size - currentJob.launching;
+  const toLaunch = Math.min(slotsAvailable, currentJob.queue.length);
 
   for (let i = 0; i < toLaunch; i++) {
-    const video = job.queue.shift();
-    job.launching++;
+    const video = currentJob.queue.shift();
+    currentJob.launching++;
 
     const url = `https://www.linkedin.com/learning/${video.courseSlug}/${video.slug}?autoSkip=true&resume=false&u=${video.uParam || ""}`;
 
-    chrome.windows.create({
-      url,
-      type: "normal",
-      width: 800,
-      height: 600,
-      focused: false,
-    }, (win) => {
-      if (!job) return;
-      job.launching--;
+    try {
+      chrome.windows.create({
+        url,
+        type: "normal",
+        width: 800,
+        height: 600,
+        focused: false,
+      }, (win) => {
+        if (job !== currentJob) return;
+        currentJob.launching--;
 
-      if (!win?.tabs?.[0]) {
-        job.failed++;
+        if (chrome.runtime.lastError || !win?.tabs?.[0]) {
+          currentJob.failed++;
+          console.error(`[LinkedLearn BG] Could not open "${video.title}": ${chrome.runtime.lastError?.message || "No tab created"}`);
+          broadcastProgress();
+          launchNextBatch();
+          finishIfComplete();
+          return;
+        }
+
+        const tabId = win.tabs[0].id;
+        currentJob.activeTabs.add(tabId);
+        currentJob.tabToWindow[tabId] = win.id;
+        console.log(`[LinkedLearn BG] Window ${win.id} → "${video.title}"`);
         broadcastProgress();
-        launchNextBatch();
-        return;
-      }
-
-      const tabId = win.tabs[0].id;
-      job.activeTabs.add(tabId);
-      job.tabToWindow[tabId] = win.id;
-      console.log(`[LinkedLearn BG] Window ${win.id} → "${video.title}"`);
-    });
+      });
+    } catch (err) {
+      currentJob.launching--;
+      currentJob.failed++;
+      console.error(`[LinkedLearn BG] Could not open "${video.title}": ${err.message}`);
+      launchNextBatch();
+    }
   }
+  finishIfComplete();
 }
 
 function handleVideoDone(tabId, title, error) {
@@ -114,19 +139,29 @@ function handleVideoDone(tabId, title, error) {
 
   if (job.queue.length > 0) {
     launchNextBatch();
-  } else if (job.activeTabs.size === 0 && job.launching === 0) {
-    broadcastDone();
-    job = null;
   }
+  finishIfComplete();
 }
 
 function cancelJob() {
   if (!job) return;
-  for (const [tabId, winId] of Object.entries(job.tabToWindow)) {
+  const currentJob = job;
+  job = null;
+  for (const winId of Object.values(currentJob.tabToWindow)) {
     chrome.windows.remove(Number(winId)).catch(() => {});
   }
-  job = null;
   console.log("[LinkedLearn BG] Cancelled");
+}
+
+function finishIfComplete() {
+  if (!job || job.queue.length > 0 || job.activeTabs.size > 0 || job.launching > 0) return;
+  broadcastDone();
+  job = null;
+}
+
+function isValidVideo(video) {
+  return video && typeof video.courseSlug === "string" &&
+    typeof video.slug === "string" && video.courseSlug && video.slug;
 }
 
 function broadcastProgress() {

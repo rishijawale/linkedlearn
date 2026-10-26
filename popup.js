@@ -33,7 +33,7 @@
       }
 
       // Check active job
-      if (info.activeJob && info.activeJob.remaining > 0) {
+      if (info.activeJob && info.activeJob.done + info.activeJob.failed < info.activeJob.total) {
         const j = info.activeJob;
         showView("view-progress");
         const pct = j.total > 0 ? ((j.done + j.failed) / j.total) * 100 : 0;
@@ -69,18 +69,25 @@
   $("#btn-retry").addEventListener("click", init);
 
   $("#btn-complete-remaining").addEventListener("click", async () => {
-    startProgress();
-    await sendToContent({ type: "COMPLETE_REMAINING", videos: courseVideos });
-    $("#progress-current").textContent = "Opening 4 tabs...";
-    $("#progress-timer").textContent = "Videos play at 10x in parallel background tabs.";
+    await startJob("COMPLETE_REMAINING");
   });
 
   $("#btn-complete-all").addEventListener("click", async () => {
-    startProgress();
-    await sendToContent({ type: "COMPLETE_ALL", videos: courseVideos });
-    $("#progress-current").textContent = "Opening 4 tabs...";
-    $("#progress-timer").textContent = "Videos play at 10x in parallel background tabs.";
+    await startJob("COMPLETE_ALL");
   });
+
+  async function startJob(type) {
+    startProgress();
+    try {
+      const response = await sendToContent({ type, videos: courseVideos });
+      if (response?.error) throw new Error(response.error);
+      $("#progress-current").textContent = "Opening 4 tabs...";
+      $("#progress-timer").textContent = "Videos play at 10x in parallel background tabs.";
+    } catch (err) {
+      $("#error-msg").textContent = `Could not start job: ${err.message}`;
+      showView("view-error");
+    }
+  }
 
   $("#btn-reload").addEventListener("click", async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });

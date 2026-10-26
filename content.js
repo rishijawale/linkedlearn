@@ -2,8 +2,14 @@
   "use strict";
 
   function getCookie(name) {
-    const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
-    return match ? decodeURIComponent(match[1]) : null;
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = document.cookie.match(new RegExp(`(?:^|; )${escapedName}=([^;]*)`));
+    if (!match) return null;
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return match[1];
+    }
   }
 
   function getCsrfToken() {
@@ -26,13 +32,21 @@
   }
 
   function extractCourseSlug() {
-    const m = window.location.pathname.match(/\/learning\/([^/?#]+)/);
-    return m ? m[1] : null;
+    const m = window.location.pathname.match(/^\/learning\/([^/]+)/);
+    return m ? decodePathPart(m[1]) : null;
   }
 
   function extractVideoSlug() {
-    const parts = window.location.pathname.split("/");
-    return parts.length >= 4 ? parts[3]?.split("?")[0] : null;
+    const m = window.location.pathname.match(/^\/learning\/[^/]+\/([^/]+)/);
+    return m ? decodePathPart(m[1]) : null;
+  }
+
+  function decodePathPart(value) {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
   }
 
   function sleep(ms) {
@@ -60,14 +74,37 @@
       "x-restli-protocol-version": "2.0.0",
     };
     if (identity) h["x-li-identity"] = identity;
-    const r = await fetch(url, { headers: h, credentials: "include" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    let r;
+    try {
+      r = await fetch(url, {
+        headers: h,
+        credentials: "include",
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err.name === "AbortError") throw new Error("LinkedIn API request timed out");
+      throw new Error(`LinkedIn API request failed: ${err.message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!r.ok) {
+      const reason = r.status === 401 || r.status === 403
+        ? "LinkedIn session expired or access was denied"
+        : `LinkedIn API returned HTTP ${r.status}`;
+      throw new Error(reason);
+    }
+    try {
+      return await r.json();
+    } catch {
+      throw new Error("LinkedIn returned an invalid API response");
+    }
   }
 
   async function fetchCourseVideos(courseSlug) {
     const data = await apiFetch(
-      `https://www.linkedin.com/learning-api/detailedCourses?addParagraphsToTranscript=false&courseSlug=${courseSlug}&q=slugs&trimCourseVideos=false`
+      `https://www.linkedin.com/learning-api/detailedCourses?addParagraphsToTranscript=false&courseSlug=${encodeURIComponent(courseSlug)}&q=slugs&trimCourseVideos=false`
     );
     const included = data.included || [];
     const course = included.find((i) => i.$type === "com.linkedin.learning.api.DetailedCourse");
@@ -133,7 +170,7 @@
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const v = findVideo();
-      if (v && v.readyState >= 1 && v.duration > 0 && !isNaN(v.duration)) return v;
+      if (v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0) return v;
       await sleep(500);
     }
     throw new Error("Video player not ready");
@@ -150,28 +187,37 @@
     console.log(`[LinkedLearn] Playing — ${duration.toFixed(1)}s`);
 
     video.muted = true;
-    video.currentTime = 0;
-
-    try { await video.play(); } catch {}
-    await sleep(500);
+    if (video.seekable.length > 0) {
+      video.currentTime = video.seekable.start(0);
+    } else {
+      video.currentTime = 0;
+    }
 
     setSpeed(TARGET_RATE);
     const enforceInterval = setInterval(() => setSpeed(TARGET_RATE), 1000);
 
-    const rateForCalc = Math.max(video.playbackRate, 2);
-    const timeoutMs = Math.max((duration / rateForCalc) * 1000 + 15000, 120000);
-
     try {
       await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("Timed out")), timeoutMs);
+        const timeoutMs = Math.max((duration / TARGET_RATE) * 1000 + 15000, 30000);
+        const timeout = setTimeout(() => finish(new Error("Video playback timed out")), timeoutMs);
 
-        function onEnded() {
+        function finish(error) {
           clearTimeout(timeout);
           video.removeEventListener("ended", onEnded);
-          resolve();
+          if (error) reject(error);
+          else resolve();
         }
+
+        function onEnded() {
+          finish();
+        }
+
         video.addEventListener("ended", onEnded);
-        if (video.ended) { clearTimeout(timeout); resolve(); }
+        if (video.ended) finish();
+
+        video.play().catch(() => {
+          finish(new Error("Could not start video playback"));
+        });
       });
 
       console.log("[LinkedLearn] Video ended");
@@ -206,22 +252,26 @@
   // ── Messages from popup (only the original tab handles these) ─────
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "GET_COURSE_INFO") {
-      handleGetCourseInfo().then(sendResponse);
+      handleGetCourseInfo()
+        .then(sendResponse)
+        .catch((err) => sendResponse({ error: err.message }));
       return true;
     }
     if (msg.type === "COMPLETE_REMAINING" || msg.type === "COMPLETE_ALL") {
       const skipCompleted = msg.type === "COMPLETE_REMAINING";
-      const videos = msg.videos || [];
+      const videos = Array.isArray(msg.videos) ? msg.videos : [];
       const toComplete = skipCompleted ? videos.filter((v) => !v.completed) : videos;
       // Send directly to background — do NOT relay through content script
-      chrome.runtime.sendMessage({ type: "START_JOB", videos: toComplete });
-      sendResponse({ started: true });
-      return false;
+      chrome.runtime.sendMessage({ type: "START_JOB", videos: toComplete })
+        .then(() => sendResponse({ started: true }))
+        .catch((err) => sendResponse({ error: err.message }));
+      return true;
     }
     if (msg.type === "CANCEL") {
-      chrome.runtime.sendMessage({ type: "CANCEL_JOB" });
-      sendResponse({ cancelled: true });
-      return false;
+      chrome.runtime.sendMessage({ type: "CANCEL_JOB" })
+        .then(() => sendResponse({ cancelled: true }))
+        .catch((err) => sendResponse({ error: err.message }));
+      return true;
     }
   });
 
